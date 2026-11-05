@@ -26,19 +26,33 @@
 #define to_nvmem_device(d) container_of(d, struct nvmem_device, dev)
 
 #define FLAG_COMPAT		BIT(0)
+struct nvmem_cell_byte_map {
+	nvmem_cell_post_process_t read_post_process;
+	void				*priv;
+	unsigned int			source_bytes;
+	unsigned int			bytes;
+	u32				map[];
+};
+
 struct nvmem_cell_entry {
 	const char		*name;
 	int			offset;
 	size_t			raw_len;
 	int			bytes;
+	int			source_bytes;
 	int			bit_offset;
 	int			nbits;
 	nvmem_cell_post_process_t read_post_process;
 	void			*priv;
+	struct nvmem_cell_byte_map *byte_map;
 	struct device_node	*np;
 	struct nvmem_device	*nvmem;
 	struct list_head	node;
 };
+
+static int nvmem_cell_byte_map_post_process(void *priv, const char *id,
+					    int index, unsigned int offset,
+					    void *buf, size_t bytes);
 
 struct nvmem_cell {
 	struct nvmem_cell_entry *entry;
@@ -552,6 +566,7 @@ static void nvmem_cell_entry_drop(struct nvmem_cell_entry *cell)
 		list_del(&cell->node);
 	of_node_put(cell->np);
 	kfree_const(cell->name);
+	kfree(cell->byte_map);
 	kfree(cell);
 }
 
@@ -650,16 +665,9 @@ static int nvmem_cell_info_to_nvmem_cell_entry(struct nvmem_device *nvmem,
 	return 0;
 }
 
-/**
- * nvmem_add_one_cell() - Add one cell information to an nvmem device
- *
- * @nvmem: nvmem device to add cells to.
- * @info: nvmem cell info to add to the device
- *
- * Return: 0 or negative error code on failure.
- */
-int nvmem_add_one_cell(struct nvmem_device *nvmem,
-		       const struct nvmem_cell_info *info)
+static int __nvmem_add_one_cell(struct nvmem_device *nvmem,
+				const struct nvmem_cell_info *info,
+				struct nvmem_cell_byte_map *map)
 {
 	struct nvmem_cell_entry *cell;
 	int rval;
@@ -674,9 +682,29 @@ int nvmem_add_one_cell(struct nvmem_device *nvmem,
 		return rval;
 	}
 
+	if (map) {
+		cell->source_bytes = cell->bytes;
+		cell->bytes = map->bytes;
+		cell->byte_map = map;
+	}
+
 	nvmem_cell_entry_add(cell);
 
 	return 0;
+}
+
+/**
+ * nvmem_add_one_cell() - Add one cell information to an nvmem device
+ *
+ * @nvmem: nvmem device to add cells to.
+ * @info: nvmem cell info to add to the device
+ *
+ * Return: 0 or negative error code on failure.
+ */
+int nvmem_add_one_cell(struct nvmem_device *nvmem,
+		       const struct nvmem_cell_info *info)
+{
+	return __nvmem_add_one_cell(nvmem, info, NULL);
 }
 EXPORT_SYMBOL_GPL(nvmem_add_one_cell);
 
@@ -803,11 +831,14 @@ static int nvmem_validate_keepouts(struct nvmem_device *nvmem)
 int nvmem_add_cells_from_dt(struct nvmem_device *nvmem, struct device_node *np)
 {
 	struct device *dev = &nvmem->dev;
-	const __be32 *addr;
+	const __be32 *addr, *bits, *byte_map;
 	int len, ret;
 
 	for_each_child_of_node_scoped(np, child) {
 		struct nvmem_cell_info info = {0};
+		struct nvmem_cell_byte_map *map = NULL;
+		unsigned int source_bytes, i;
+		int map_len;
 
 		addr = of_get_property(child, "reg", &len);
 		if (!addr)
@@ -819,12 +850,20 @@ int nvmem_add_cells_from_dt(struct nvmem_device *nvmem, struct device_node *np)
 
 		info.offset = be32_to_cpup(addr++);
 		info.bytes = be32_to_cpup(addr);
-		info.name = kasprintf(GFP_KERNEL, "%pOFn", child);
+		source_bytes = info.bytes;
 
-		addr = of_get_property(child, "bits", &len);
-		if (addr && len == (2 * sizeof(u32))) {
-			info.bit_offset = be32_to_cpup(addr++);
-			info.nbits = be32_to_cpup(addr);
+		bits = of_get_property(child, "bits", &len);
+		byte_map = of_get_property(child, "byte-map", &len);
+		if (bits && byte_map) {
+			dev_err(dev, "nvmem: bits and byte-map both specified on %pOF\n",
+				child);
+			return -EINVAL;
+		}
+
+		if (bits && of_property_count_elems_of_size(child, "bits",
+						    sizeof(u32)) == 2) {
+			info.bit_offset = be32_to_cpup(bits++);
+			info.nbits = be32_to_cpup(bits);
 			if (info.bit_offset >= BITS_PER_BYTE * info.bytes ||
 			    info.nbits < 1 ||
 			    info.bit_offset + info.nbits > BITS_PER_BYTE * info.bytes) {
@@ -833,15 +872,53 @@ int nvmem_add_cells_from_dt(struct nvmem_device *nvmem, struct device_node *np)
 			}
 		}
 
+		if (byte_map) {
+			map_len = of_property_count_elems_of_size(child, "byte-map",
+							  sizeof(u32));
+			if (map_len <= 0) {
+				dev_err(dev, "nvmem: invalid byte-map on %pOF\n", child);
+				return -EINVAL;
+			}
+
+			for (i = 0; i < map_len; i++) {
+				if (be32_to_cpup(byte_map + i) >= source_bytes) {
+					dev_err(dev, "nvmem: invalid byte-map on %pOF\n", child);
+					return -EINVAL;
+				}
+			}
+		}
+
+		info.name = kasprintf(GFP_KERNEL, "%pOFn", child);
+
 		info.np = of_node_get(child);
 
 		if (nvmem->fixup_dt_cell_info)
 			nvmem->fixup_dt_cell_info(nvmem, &info);
 
-		ret = nvmem_add_one_cell(nvmem, &info);
+		if (byte_map) {
+			map = kmalloc(struct_size(map, map, map_len), GFP_KERNEL);
+			if (!map) {
+				kfree(info.name);
+				of_node_put(info.np);
+				return -ENOMEM;
+			}
+
+			map->read_post_process = info.read_post_process;
+			map->priv = info.priv;
+			map->source_bytes = source_bytes;
+			map->bytes = map_len;
+			for (i = 0; i < map_len; i++)
+				map->map[i] = be32_to_cpup(byte_map + i);
+
+			info.read_post_process = nvmem_cell_byte_map_post_process;
+			info.priv = map;
+		}
+
+		ret = __nvmem_add_one_cell(nvmem, &info, map);
 		kfree(info.name);
 		if (ret) {
 			of_node_put(info.np);
+			kfree(map);
 			return ret;
 		}
 	}
@@ -1605,6 +1682,7 @@ static void nvmem_shift_read_buffer_in_place(struct nvmem_cell_entry *cell, void
 {
 	u8 *p, *b;
 	int i, extra, bytes_offset;
+	int bytes = cell->source_bytes ?: cell->bytes;
 	int bit_offset = cell->bit_offset;
 
 	p = b = buf;
@@ -1618,30 +1696,58 @@ static void nvmem_shift_read_buffer_in_place(struct nvmem_cell_entry *cell, void
 		*p = *b++ >> bit_offset;
 
 		/* setup rest of the bytes if any */
-		for (i = 1; i < (cell->bytes - bytes_offset); i++) {
+		for (i = 1; i < (bytes - bytes_offset); i++) {
 			/* Get bits from next byte and shift them towards msb */
 			*p++ |= *b << (BITS_PER_BYTE - bit_offset);
 
 			*p = *b++ >> bit_offset;
 		}
 		/* point to end of the buffer unused bits will be cleared */
-		p = buf + cell->bytes - 1;
+		p = buf + bytes - 1;
 	} else if (p != b) {
-		memmove(p, b, cell->bytes - bytes_offset);
-		p += cell->bytes - 1;
+		memmove(p, b, bytes - bytes_offset);
+		p += bytes - 1;
 	} else {
 		/* point to the msb */
-		p += cell->bytes - 1;
+		p += bytes - 1;
 	}
 
 	/* result fits in less bytes */
-	extra = cell->bytes - DIV_ROUND_UP(cell->nbits, BITS_PER_BYTE);
+	extra = bytes - DIV_ROUND_UP(cell->nbits, BITS_PER_BYTE);
 	while (--extra >= 0)
 		*p-- = 0;
 
 	/* clear msb bits if any leftover in the last byte */
 	if (cell->nbits % BITS_PER_BYTE)
 		*p &= GENMASK((cell->nbits % BITS_PER_BYTE) - 1, 0);
+}
+
+static int nvmem_cell_byte_map_post_process(void *priv, const char *id,
+					    int index, unsigned int offset,
+					    void *buf, size_t bytes)
+{
+	struct nvmem_cell_byte_map *map = priv;
+	u8 *source;
+	unsigned int i;
+	int ret;
+
+	if (map->read_post_process) {
+		ret = map->read_post_process(map->priv, id, index, offset, buf,
+					     bytes);
+		if (ret)
+			return ret;
+	}
+
+	source = kmemdup(buf, map->source_bytes, GFP_KERNEL);
+	if (!source)
+		return -ENOMEM;
+
+	for (i = 0; i < map->bytes; i++)
+		((u8 *)buf)[i] = source[map->map[i]];
+
+	kfree(source);
+
+	return 0;
 }
 
 static int __nvmem_cell_read(struct nvmem_device *nvmem,
@@ -1692,7 +1798,8 @@ void *nvmem_cell_read(struct nvmem_cell *cell, size_t *len)
 	if (!nvmem)
 		return ERR_PTR(-EINVAL);
 
-	buf = kzalloc(max_t(size_t, entry->raw_len, entry->bytes), GFP_KERNEL);
+	buf = kzalloc(max3(entry->raw_len, (size_t)entry->source_bytes,
+			   (size_t)entry->bytes), GFP_KERNEL);
 	if (!buf)
 		return ERR_PTR(-ENOMEM);
 
@@ -1912,7 +2019,7 @@ static const void *nvmem_cell_read_variable_common(struct device *dev,
 	if (IS_ERR(cell))
 		return cell;
 
-	nbits = cell->entry->nbits;
+	nbits = cell->entry->byte_map ? 0 : cell->entry->nbits;
 	buf = nvmem_cell_read(cell, len);
 	nvmem_cell_put(cell);
 	if (IS_ERR(buf))
