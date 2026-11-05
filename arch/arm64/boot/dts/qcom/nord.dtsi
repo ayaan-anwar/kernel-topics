@@ -1968,6 +1968,8 @@
 			snps,axi-config = <&emac0_axi_setup>;
 			snps,mtl-rx-config = <&emac0_mtl_rx>;
 			snps,mtl-tx-config = <&emac0_mtl_tx>;
+			nvmem-cells = <&emac0_mac_address>;
+			nvmem-cell-names = "mac-address";
 
 			status = "disabled";
 
@@ -2109,6 +2111,8 @@
 			snps,axi-config = <&emac1_axi_setup>;
 			snps,mtl-rx-config = <&emac1_mtl_rx>;
 			snps,mtl-tx-config = <&emac1_mtl_tx>;
+			nvmem-cells = <&emac1_mac_address>;
+			nvmem-cell-names = "mac-address";
 
 			status = "disabled";
 
@@ -7528,6 +7532,29 @@
 				    "llcc15_base",
 				    "llcc_broadcast_base",
 				    "llcc_broadcast_and_base";
+		};
+
+		qfprom: efuse@360d4000 {
+			compatible = "qcom,nord-qfprom", "qcom,qfprom";
+			reg = <0x0 0x360d4000 0x0 0x4000>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			nvmem-layout {
+				compatible = "fixed-layout";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				emac0_mac_address: mac-address@320 {
+					reg = <0x320 0x7>;
+					byte-map = <0 1 2 3 4 5>;
+				};
+
+				emac1_mac_address: mac-address@320,1 {
+					reg = <0x320 0x7>;
+					byte-map = <0 1 2 3 4 6>;
+				};
+			};
 		};
 	};
 
