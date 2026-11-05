@@ -34,7 +34,20 @@ properties:
         description:
           Size in bit within the address range specified by reg.
 
+  byte-map:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 256
+    description: |
+      Ordered list of byte offsets within the address range specified by reg.
+      The cell value contains the bytes at these offsets in the listed order.
+      Offsets may be omitted, reordered, or repeated.
+
 allOf:
+  - not:
+      required:
+        - bits
+        - byte-map
   - if:
       properties:
         compatible:
